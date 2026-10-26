@@ -1,0 +1,308 @@
+import React, { createContext, useContext, useEffect, useMemo, useRef, useState } from 'react';
+import { useSettings } from './SettingsContext';
+
+const InventoryContext = createContext(null);
+const STORAGE_KEY = 'pos_products';
+
+const safeNumber = (value) => {
+  const number = Number(value);
+  return Number.isFinite(number) ? Math.max(0, Math.floor(number)) : 0;
+};
+
+const makeUnitId = () => {
+  const random = typeof crypto !== 'undefined' && crypto.randomUUID
+    ? crypto.randomUUID().replace(/-/g, '').slice(0, 12).toUpperCase()
+    : `${Date.now().toString(36)}${Math.random().toString(36).slice(2, 8)}`.toUpperCase();
+  return `SH-${random}`;
+};
+
+const createUnit = (productId, status = 'available', qrValue = null) => {
+  const unitId = makeUnitId();
+  return {
+    unitId,
+    productId: String(productId),
+    qrValue: qrValue == null ? null : String(qrValue),
+    status,
+    createdAt: new Date().toISOString(),
+  };
+};
+
+const SEEDED_PRODUCTS = new Set([
+  '1|BATA001',
+  '2|NIKE001',
+  '3|WOOD001',
+]);
+
+const reconcileUnits = (product, priorUnits) => {
+  const targetStock = safeNumber(product.stock);
+  const units = Array.isArray(priorUnits)
+    ? priorUnits.map((unit) => {
+        const unitId = String(unit.unitId || makeUnitId());
+        return {
+          ...unit,
+          unitId,
+          productId: String(product.id),
+          qrValue: unit.qrValue == null || String(unit.qrValue) === '' ? null : String(unit.qrValue),
+          status: unit.status || 'available',
+        };
+      })
+    : [];
+
+  let available = units.filter((unit) => unit.status === 'available');
+  while (available.length < targetStock) {
+    const unit = createUnit(product.id);
+    units.push(unit);
+    available.push(unit);
+  }
+  if (available.length > targetStock) {
+    let toDeactivate = available.length - targetStock;
+    for (let i = units.length - 1; i >= 0 && toDeactivate > 0; i -= 1) {
+      if (units[i].status === 'available') {
+        units[i] = { ...units[i], status: 'removed', removedAt: new Date().toISOString() };
+        toDeactivate -= 1;
+      }
+    }
+  }
+  return units;
+};
+
+const readProducts = () => {
+  try {
+    const raw = localStorage.getItem(STORAGE_KEY);
+    if (raw) {
+      const parsed = JSON.parse(raw);
+      if (Array.isArray(parsed)) {
+        const products = parsed.filter((product) =>
+          !SEEDED_PRODUCTS.has(`${String(product.id)}|${String(product.barcode || '')}`)
+        );
+        if (products.length !== parsed.length) {
+          localStorage.setItem(STORAGE_KEY, JSON.stringify(products));
+        }
+        return products.map((product) => {
+          const normalized = { ...product, id: String(product.id), stock: safeNumber(product.stock) };
+          return { ...normalized, qrUnits: reconcileUnits(normalized, product.qrUnits) };
+        });
+      }
+    }
+  } catch (error) {
+    console.error('Could not load saved inventory:', error);
+  }
+
+  return [];
+};
+
+export const useInventory = () => {
+  const context = useContext(InventoryContext);
+  if (!context) throw new Error('useInventory must be used within an InventoryProvider');
+  return context;
+};
+
+export const InventoryProvider = ({ children }) => {
+  const { shopSettings } = useSettings();
+  const [products, setProducts] = useState(() => readProducts());
+  const productsRef = useRef(products);
+  const categories = shopSettings.categories;
+
+  // Keep a synchronous snapshot so Add Using QR can create a product and register its
+  // scanned QR payloads in the same submit event, before React re-renders.
+  const commitProducts = (updater) => {
+    const next = typeof updater === 'function' ? updater(productsRef.current) : updater;
+    productsRef.current = next;
+    setProducts(next);
+    return next;
+  };
+
+  useEffect(() => {
+    productsRef.current = products;
+  }, [products]);
+
+  useEffect(() => {
+    try {
+      localStorage.setItem(STORAGE_KEY, JSON.stringify(products));
+    } catch (error) {
+      console.error('Could not save inventory:', error);
+    }
+  }, [products]);
+
+  const addProduct = (product) => {
+    const id = String(product.id || `PRD-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`);
+    const stock = safeNumber(product.stock);
+    const newProduct = {
+      ...product,
+      id,
+      stock,
+      // Inventory units are tracked internally; QR payloads are only set when explicitly registered.
+      qrUnits: reconcileUnits(
+        { ...product, id, stock },
+        Array.isArray(product.qrUnits)
+          ? product.qrUnits.map((unit) => ({
+              ...unit,
+              unitId: unit.unitId || makeUnitId(),
+              productId: id,
+              qrValue: unit.qrValue == null || String(unit.qrValue) === '' ? null : String(unit.qrValue),
+              status: unit.status || 'available',
+            }))
+          : [],
+      ),
+    };
+    commitProducts((current) => [...current, newProduct]);
+    return newProduct;
+  };
+
+  const updateProduct = (id, updatedProduct) => {
+    commitProducts((current) => current.map((product) => {
+      if (String(product.id) !== String(id)) return product;
+      const merged = { ...product, ...updatedProduct, id: String(id), stock: safeNumber(updatedProduct.stock ?? product.stock) };
+      return { ...merged, qrUnits: reconcileUnits(merged, product.qrUnits) };
+    }));
+  };
+
+  const deleteProduct = (id) => {
+    commitProducts((current) => current.filter((product) => String(product.id) !== String(id)));
+  };
+
+  /**
+   * Register existing QR payloads without changing their payload values.
+   * Each QR value may represent multiple physical boxes; every box receives a
+   * unique internal unitId while sharing the scanned qrValue.
+   * Accepts strings for legacy callers or { value, quantity } records.
+   */
+  const registerExistingQrUnits = (productId, qrValues) => {
+    const product = productsRef.current.find((entry) => String(entry.id) === String(productId));
+    if (!product) return { success: false, added: 0, duplicates: [], error: 'Please select a valid product.' };
+
+    const inputItems = Array.isArray(qrValues) ? qrValues : [qrValues];
+    const quantitiesByValue = new Map();
+    inputItems.forEach((item) => {
+      const value = String(item && typeof item === 'object' ? item.value ?? '' : item ?? '').trim();
+      if (!value) return;
+      const quantity = item && typeof item === 'object'
+        ? Math.max(1, safeNumber(item.quantity) || 1)
+        : 1;
+      quantitiesByValue.set(value, (quantitiesByValue.get(value) || 0) + quantity);
+    });
+    if (!quantitiesByValue.size) {
+      return { success: false, added: 0, duplicates: [], error: 'Scan or enter at least one QR code.' };
+    }
+
+    const allUnits = productsRef.current.flatMap((entry) => (entry.qrUnits || []).map((unit) => ({ ...unit, ownerProductId: String(entry.id) })));
+    const registeredOwners = new Map();
+    allUnits.forEach((unit) => {
+      const value = String(unit.qrValue ?? '').trim();
+      if (!value) return;
+      if (!registeredOwners.has(value)) registeredOwners.set(value, new Set());
+      registeredOwners.get(value).add(String(unit.ownerProductId));
+    });
+
+    const conflicts = [];
+    for (const value of quantitiesByValue.keys()) {
+      const owners = registeredOwners.get(value);
+      if (owners && [...owners].some((ownerId) => ownerId !== String(productId))) conflicts.push(value);
+    }
+    if (conflicts.length) {
+      return {
+        success: false,
+        added: 0,
+        duplicates: conflicts,
+        error: 'One or more QR values are already assigned to a different product. No stock was changed.',
+      };
+    }
+
+    const now = new Date().toISOString();
+    const newUnits = [];
+    quantitiesByValue.forEach((quantity, value) => {
+      for (let index = 0; index < quantity; index += 1) {
+        newUnits.push({
+          ...createUnit(product.id, 'available', value),
+          registeredAt: now,
+          qrSource: 'existing',
+        });
+      }
+    });
+
+    commitProducts((current) => current.map((entry) => {
+      if (String(entry.id) !== String(productId)) return entry;
+      const currentUnits = Array.isArray(entry.qrUnits) ? entry.qrUnits : [];
+      return {
+        ...entry,
+        stock: safeNumber(entry.stock) + newUnits.length,
+        qrUnits: [...currentUnits, ...newUnits],
+      };
+    }));
+    return { success: true, added: newUnits.length, duplicates: [], units: newUnits };
+  };
+
+  // soldUnitIds/returnedUnitIds allow POS checkout and returns to preserve each physical unit's identity.
+  const updateStock = (id, requestedStock, options = {}) => {
+    const nextStock = safeNumber(requestedStock);
+    commitProducts((current) => current.map((product) => {
+      if (String(product.id) !== String(id)) return product;
+      const previousStock = safeNumber(product.stock);
+      let units = [...(product.qrUnits || [])];
+      const now = new Date().toISOString();
+
+      if (nextStock < previousStock) {
+        let remaining = previousStock - nextStock;
+        const preferred = new Set((options.soldUnitIds || []).map(String));
+        if (preferred.size) {
+          units = units.map((unit) => {
+            if (remaining > 0 && preferred.has(String(unit.unitId)) && unit.status === 'available') {
+              remaining -= 1;
+              return { ...unit, status: 'sold', soldAt: now };
+            }
+            return unit;
+          });
+        }
+        if (remaining > 0) {
+          units = units.map((unit) => {
+            if (remaining > 0 && unit.status === 'available') {
+              remaining -= 1;
+              return { ...unit, status: 'sold', soldAt: now };
+            }
+            return unit;
+          });
+        }
+      } else if (nextStock > previousStock) {
+        let remaining = nextStock - previousStock;
+        const preferred = new Set((options.returnedUnitIds || []).map(String));
+        if (preferred.size) {
+          units = units.map((unit) => {
+            if (remaining > 0 && preferred.has(String(unit.unitId)) && unit.status === 'sold') {
+              remaining -= 1;
+              const { soldAt, ...rest } = unit;
+              return { ...rest, status: 'available', returnedAt: now };
+            }
+            return unit;
+          });
+        }
+        if (remaining > 0) {
+          const sold = units.filter((unit) => unit.status === 'sold');
+          for (const soldUnit of sold) {
+            if (remaining <= 0) break;
+            units = units.map((unit) => {
+              if (unit.unitId !== soldUnit.unitId) return unit;
+              const { soldAt, ...rest } = unit;
+              return { ...rest, status: 'available', returnedAt: now };
+            });
+            remaining -= 1;
+          }
+        }
+        while (remaining > 0) {
+          units.push(createUnit(product.id));
+          remaining -= 1;
+        }
+      }
+
+      units = reconcileUnits({ ...product, stock: nextStock }, units);
+      return { ...product, stock: nextStock, qrUnits: units };
+    }));
+  };
+
+  const getLowStockProducts = () => products.filter((product) => product.stock <= 2);
+  const value = useMemo(() => ({
+    products, categories, addProduct, updateProduct, deleteProduct, updateStock,
+    registerExistingQrUnits, getLowStockProducts,
+  }), [products, categories]);
+
+  return <InventoryContext.Provider value={value}>{children}</InventoryContext.Provider>;
+};
